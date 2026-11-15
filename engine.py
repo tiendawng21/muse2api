@@ -1062,6 +1062,28 @@ class MuseEngine:
         "b.click();return 'clicked';})()"
     )
 
+    def _page_diag(self) -> str:
+        """[PATCH v2] Compact page-state snapshot for failure diagnosis."""
+        try:
+            out = self.page.js("""(function(){
+                var ta = document.querySelector('textarea');
+                var h = document.querySelector('[data-hatch-shell-hydration-state]');
+                var st = 'unknown';
+                if (document.readyState !== 'complete') st = 'loading';
+                else if (!ta) st = 'no-ta';
+                else if (h && h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') st = 'hydrating';
+                else if ((document.body ? (document.body.innerText || '') : '').indexOf('Connecting...') !== -1) st = 'connecting';
+                else if (ta.disabled) st = 'input-disabled';
+                else st = 'ready';
+                return JSON.stringify({
+                    url: location.href, title: document.title, state: st,
+                    body: (document.body ? (document.body.innerText || '') : '').slice(0, 300)
+                });
+            })()""")
+            return str(out)[:600]
+        except Exception as e:
+            return "diag-failed: %s" % e
+
     def _send(self, prompt: str):
         # 0. 先等页面真正就绪：慢速机器上页面会重挂载，单次查询必漏。
         #    复用 _wait_ws_ready 的完整就绪判定（textarea 存在 + 已水合 + 非 Connecting + 可用）。
@@ -1070,7 +1092,18 @@ class MuseEngine:
         except (TypeError, ValueError):
             _send_wait = 90.0
         if not self._wait_ws_ready(self.page, timeout=_send_wait):
-            raise MuseGenerationError("找不到聊天输入框")
+            # [PATCH v2] One self-recovery attempt: re-navigate to a fresh
+            # thread and wait again before giving up.
+            try:
+                self.page.send("Page.navigate",
+                               {"url": "https://muse.ai/thread/new"})
+            except Exception:
+                pass
+            if not self._wait_ws_ready(self.page, timeout=60.0):
+                # [PATCH v2] Fail with a page-state snapshot so the failure
+                # is diagnosable from the panel error text alone.
+                raise MuseGenerationError(
+                    "找不到聊天输入框 | diag: " + self._page_diag())
         # 1. 确保 textarea 滚动到视口中央并获得真实焦点
         try:
             self.page.js("""(function(){
