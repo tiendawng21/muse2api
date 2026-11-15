@@ -1,0 +1,20 @@
+{
+  "name": "muse2api bridge (Codespaces)",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends chromium fonts-wqy-zenhei fonts-freefont-ttf procps curl && python3 -m venv .venv && .venv/bin/pip install --no-cache-dir -r requirements.txt",
+  "postStartCommand": "pkill -f 'uvicorn app:app' 2>/dev/null; nohup .venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 18610 > /tmp/bridge.log 2>&1 &",
+  "forwardPorts": [18610],
+  "portsAttributes": {
+    "18610": { "label": "muse2api panel/API", "visibility": "public" }
+  },
+  "remoteEnv": {
+    "MUSE2API_HOST": "0.0.0.0",
+    "MUSE2API_PORT": "18610",
+    "MUSE2API_CDP_PORT": "19210",
+    "MUSE2API_CHROMIUM": "/usr/bin/chromium",
+    "MUSE2API_CONCURRENCY": "1",
+    "MUSE2API_LOGIN_WAIT": "180",
+    "MUSE2API_VIDEO_TIMEOUT": "900",
+    "MUSE2API_IMAGE_TIMEOUT": "600"
+  }
+}
