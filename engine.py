@@ -1092,6 +1092,12 @@ class MuseEngine:
         except (TypeError, ValueError):
             _send_wait = 90.0
         if not self._wait_ws_ready(self.page, timeout=_send_wait):
+            # [PATCH v3] Snapshot the stuck state to the service log
+            # (Render Logs) before attempting recovery.
+            try:
+                log.warning("SEND-WAIT-EXPIRED diag: %s", self._page_diag())
+            except Exception:
+                pass
             # [PATCH v2] One self-recovery attempt: re-navigate to a fresh
             # thread and wait again before giving up.
             try:
@@ -1100,10 +1106,16 @@ class MuseEngine:
             except Exception:
                 pass
             if not self._wait_ws_ready(self.page, timeout=60.0):
-                # [PATCH v2] Fail with a page-state snapshot so the failure
-                # is diagnosable from the panel error text alone.
-                raise MuseGenerationError(
-                    "找不到聊天输入框 | diag: " + self._page_diag())
+                # [PATCH v3] The panel translates the stock Chinese error
+                # string into a canned label and drops any suffix, so log
+                # the snapshot (Render Logs) and raise with a unique text
+                # that passes through the panel untranslated.
+                _diag = self._page_diag()
+                try:
+                    log.warning("SEND-NOT-READY diag: %s", _diag)
+                except Exception:
+                    pass
+                raise MuseGenerationError("send-not-ready :: " + _diag)
         # 1. 确保 textarea 滚动到视口中央并获得真实焦点
         try:
             self.page.js("""(function(){
