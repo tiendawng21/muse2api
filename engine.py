@@ -729,7 +729,7 @@ class MuseEngine:
             })(%s)""" % ("true" if for_chat else "false"))
             if needs_nav:
                 self.page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
-                t_end = time.time() + 10.0
+                t_end = time.time() + 30.0
                 while time.time() < t_end:
                     time.sleep(0.08)
                     ready = self.page.js("""(function(){
@@ -739,7 +739,7 @@ class MuseEngine:
                     })()""")
                     if ready:
                         break
-                self._wait_ws_ready(self.page, timeout=12.0)
+                self._wait_ws_ready(self.page, timeout=30.0)
         except Exception:
             pass
 
@@ -1063,6 +1063,14 @@ class MuseEngine:
     )
 
     def _send(self, prompt: str):
+        # 0. 先等页面真正就绪：慢速机器上页面会重挂载，单次查询必漏。
+        #    复用 _wait_ws_ready 的完整就绪判定（textarea 存在 + 已水合 + 非 Connecting + 可用）。
+        try:
+            _send_wait = float(os.environ.get("MUSE2API_SEND_WAIT", "90"))
+        except (TypeError, ValueError):
+            _send_wait = 90.0
+        if not self._wait_ws_ready(self.page, timeout=_send_wait):
+            raise MuseGenerationError("找不到聊天输入框")
         # 1. 确保 textarea 滚动到视口中央并获得真实焦点
         try:
             self.page.js("""(function(){
@@ -1508,7 +1516,7 @@ class MuseEngine:
 
         t_sent = time.time()
         deadline = t_sent + timeout
-        first_token_deadline = min(deadline, t_sent + 40.0)
+        first_token_deadline = min(deadline, t_sent + float(os.environ.get("MUSE2API_FIRST_TOKEN_TIMEOUT", "180")))
         sent, last, stable = "", None, 0
         got_first = False
 
