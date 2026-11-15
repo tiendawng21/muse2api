@@ -681,6 +681,7 @@ class MuseEngine:
     def _wait_ws_ready(self, page: CDP, timeout: float = 15.0) -> bool:
         """等待 muse.ai 页面完成 React hydration 且不再处于 Connecting... 状态。"""
         deadline = time.time() + timeout
+        last_fix = 0.0
         while time.time() < deadline:
             try:
                 st = page.js("""(function(){
@@ -696,6 +697,21 @@ class MuseEngine:
                 })()""")
                 if st == "ready":
                     return True
+                if st == "no-ta" and time.time() - last_fix > 3.0:
+                    # [PATCH v4] muse.ai sometimes serves its own error
+                    # boundary ("Something went wrong" / "Try again") instead
+                    # of the chat UI. Click Try again (or reload) and keep
+                    # waiting instead of timing out on a dead page.
+                    last_fix = time.time()
+                    page.js("""(function(){
+                        var b = document.body ? (document.body.innerText || '') : '';
+                        if (b.indexOf('Something went wrong') === -1) return 0;
+                        var els = [...document.querySelectorAll('button, a, [role="button"]')];
+                        var t = els.find(function(e){ return (e.innerText || '').trim().indexOf('Try again') !== -1; });
+                        if (t) { t.click(); return 1; }
+                        location.reload();
+                        return 2;
+                    })()""")
             except Exception:
                 pass
             time.sleep(0.1)
@@ -1930,6 +1946,18 @@ class MuseEngine:
             raise MuseGenerationError("任务准备超时，已停止发送")
         if self._send(prompt) not in ("clicked", "enter-sent"):
             raise MuseGenerationError("提示词发送未确认，已停止生成")
+        # [PATCH v4] The slow early stages may have eaten most of the task
+        # budget; guarantee the result stage its own wait window, and log
+        # the page state right after the confirmed send.
+        try:
+            _rw = float(os.environ.get("MUSE2API_RESULT_WAIT", "300"))
+        except (TypeError, ValueError):
+            _rw = 300.0
+        deadline = max(deadline, time.monotonic() + _rw)
+        try:
+            log.warning("SEND-OK state: %s", self._page_diag())
+        except Exception:
+            pass
         os.makedirs(self.cfg.media_dir, exist_ok=True)
         # 页面若把刚上传的素材渲染成"结果"，按哈希识别出来并继续等待真正的成品
         while time.monotonic() < deadline:
@@ -1942,6 +1970,10 @@ class MuseEngine:
             )
             if not att:
                 self._debug_dump("no-attachment")
+                try:
+                    log.warning("NO-RESULT state: %s", self._page_diag())
+                except Exception:
+                    pass
                 raise MuseGenerationError("等待生成超时，未出现新的生成结果")
 
             data = mime = url = None
