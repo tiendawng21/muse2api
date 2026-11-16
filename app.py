@@ -367,7 +367,7 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 
 
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
-                     timeout: int, account_id: str | None):
+                     timeout: int, account_id: str | None, pinned: bool = False):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
@@ -390,10 +390,10 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         ACCOUNT_POOL.release(leased_id)
                         leased_id = None
                     try:
-                        alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=timeout)
+                        alt = ACCOUNT_POOL.acquire(account_id=account_id, timeout=timeout) if pinned else ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=timeout)
                     except Exception:
                         break
-                    if not alt or alt["id"] == cur_id:
+                    if not alt or (not pinned and alt["id"] == cur_id):
                         if alt:
                             leased_id = alt["id"]
                         break
@@ -401,7 +401,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     leased_id = cur_id
                     cur_cookies = alt["cookies"]
                     cur_exp = alt.get("cookies_exp")
-                    log.info("【对话自动切号】切换到备用账号 %s (%s) 重试...", alt.get("label"), cur_id)
+                    if not pinned:
+                        log.info("【对话自动切号】切换到备用账号 %s (%s) 重试...", alt.get("label"), cur_id)
                 elif cur_id:
                     ACCOUNT_POOL.acquire(account_id=cur_id, timeout=timeout)
                     leased_id = cur_id
@@ -484,6 +485,7 @@ class ImageRequest(BaseModel):
     audios: list | None = None
     files: list | None = None
     reference_image: str | None = None
+    account_id: str | None = None   # gán vai: id hoặc label của tài khoản trong bể; trống = cầu tự chọn
     async_: bool = Field(False, alias="async")
 
 
@@ -503,6 +505,7 @@ class VideoRequest(BaseModel):
     files: list | None = None
     image_url: Any = None
     reference_image: str | None = None
+    account_id: str | None = None   # gán vai: id hoặc label của tài khoản trong bể; trống = cầu tự chọn
 
 
 class ChatMessage(BaseModel):
@@ -527,6 +530,7 @@ class ChatRequest(BaseModel):
     timeout: int | None = None
     prompt: str | None = None       # 兼容把 prompt 直接放顶层的客户端
     # 下面这些声明出来只是为了「能读到」，muse.ai 端不做对应处理
+    account_id: str | None = None   # gán vai: id hoặc label của tài khoản trong bể; trống = cầu tự chọn
     tools: list | None = None
     tool_choice: object | None = None
     response_format: object | None = None
@@ -1139,13 +1143,20 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 rem = int(deadline - time.monotonic()) if deadline is not None else timeout
                 if rem <= 0:
                     break
-                alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=rem)
-                if not alt or (old_id and alt["id"] == old_id):
-                    if alt:
-                        cur_acc = alt
-                    break
-                cur_acc = alt
-                log.info("【生图/视频自动切号】切换到备用账号 %s (%s) 重试...", cur_acc.get("label"), cur_acc["id"])
+                if account_id:
+                    # Đã gán vai: thử lại đúng tài khoản đó, tuyệt đối không xoay nick khác.
+                    try:
+                        cur_acc = ACCOUNT_POOL.acquire(account_id=account_id, timeout=rem)
+                    except Exception:
+                        break
+                else:
+                    alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=rem)
+                    if not alt or (old_id and alt["id"] == old_id):
+                        if alt:
+                            cur_acc = alt
+                        break
+                    cur_acc = alt
+                    log.info("【生图/视频自动切号】切换到备用账号 %s (%s) 重试...", cur_acc.get("label"), cur_acc["id"])
             try:
                 _bind_account_proxy(cur_acc)
                 refreshed = _renew_and_persist(cur_acc["id"], wake_vm=True, force=(attempt > 0))
@@ -1250,6 +1261,26 @@ def _prepare_reference_images(images: list[str]) -> list[str]:
     return prepared
 
 
+def _resolve_account_hint(hint: str | None) -> str | None:
+    """Gán vai theo nick: hint là id hoặc label của tài khoản trong bể.
+    Trả về account id; hint trống -> None (cầu tự chọn như cũ).
+    Hint không khớp / tài khoản đã tắt -> 400 với thông điệp rõ ràng."""
+    if not hint:
+        return None
+    hint = str(hint).strip()
+    if not hint:
+        return None
+    acc = store.get_account(hint)
+    if acc is None:
+        for a in store.accounts:
+            if (a.get("label") or "") == hint:
+                acc = a
+                break
+    if acc is None or not acc.get("enabled", True) or not acc.get("cookies"):
+        raise HTTPException(400, f"Assigned account '{hint}' not found in pool or disabled — check TD Muse Studio account roles")
+    return acc["id"]
+
+
 def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
                  idempotency_key: str | None = None):
     """Opt-in polling avoids reverse-proxy timeouts; no generation is repeated by polling."""
@@ -1289,6 +1320,7 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
         try:
             res, acc_id = _run_generation(
                 prompt, "image", req.timeout or CFG.image_timeout,
+                account_id=_resolve_account_hint(req.account_id),
                 reference_images=reference_images,
                 on_progress=lambda p: store.update_task(tid, progress=p),
                 on_acquired=_on_acquired)
@@ -1311,6 +1343,7 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
 @app.post("/v1/images/tasks")
 def create_image_task(req: ImageRequest,
                       idempotency_key: str | None = Header(default=None), _=Depends(auth)):
+    _resolve_account_hint(req.account_id)
     refs = _prepare_reference_images(_image_references(req))
     return _queue_image(req, build_image_prompt(req, _reference_kinds(refs)), refs, idempotency_key)
 
@@ -1335,11 +1368,13 @@ async def images_generations(req: ImageRequest, _=Depends(auth)):
 
     prompt = build_image_prompt(req, _reference_kinds(ref_images))
     timeout = req.timeout or CFG.image_timeout
+    _resolve_account_hint(req.account_id)
     if req.async_:
         return _queue_image(req, prompt, ref_images)
     try:
         res, _acc = await asyncio.to_thread(
-            _run_generation, prompt, "image", timeout, reference_images=ref_images)
+            _run_generation, prompt, "image", timeout,
+            account_id=_resolve_account_hint(req.account_id), reference_images=ref_images)
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc)) from exc
     except MuseGenerationError as exc:
@@ -1454,6 +1489,7 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
     ref_images = await asyncio.to_thread(
         _prepare_reference_images, _video_references(req))
 
+    _resolve_account_hint(req.account_id)
     prompt = build_video_prompt(req, _reference_kinds(ref_images))
     timeout = req.timeout or CFG.video_timeout
     task = store.create_task("video", req.prompt)
@@ -1470,6 +1506,7 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
             def prog_cb(p):
                 store.update_task(task["id"], progress=p)
             res, acc_id = _run_generation(prompt, "video", timeout, on_progress=prog_cb,
+                                          account_id=_resolve_account_hint(req.account_id),
                                           reference_images=ref_images, on_acquired=_on_acquired)
             vurl = media_url(res["filename"])
             store.update_task(task["id"], status="completed", progress=100, account=acc_id,
@@ -1584,7 +1621,8 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
 
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
-    acc = store.pick_account(rotate=True)
+    _pinned_id = _resolve_account_hint(req.account_id)
+    acc = store.get_account(_pinned_id) if _pinned_id else store.pick_account(rotate=True)
     if not acc:
         raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
 
@@ -1609,7 +1647,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                 # 握手建立瞬间立即发送 role: assistant 首包，让下游客户端秒级捕获光标
                 yield _sse(_chat_chunk(cid, created, model, {"role": "assistant"}))
 
-                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id)
+                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, pinned=bool(_pinned_id))
                 if not tool_note:
                     for chunk in stream_gen:
                         for piece in _pace_text(chunk):
@@ -1671,7 +1709,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, pinned=bool(_pinned_id)))
 
     try:
         text = await asyncio.to_thread(run)
@@ -1782,7 +1820,7 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                     "part": {"type": "output_text", "text": "",
                              "annotations": []}})
                 full = ""
-                for chunk in safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id):
+                for chunk in safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, pinned=False):
                     full += chunk
                     yield _sse_event("response.output_text.delta", {
                         "type": "response.output_text.delta", "item_id": mid,
@@ -1807,7 +1845,7 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, pinned=False))
 
     try:
         text = await asyncio.to_thread(run)
