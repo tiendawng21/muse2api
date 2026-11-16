@@ -1637,6 +1637,171 @@ def get_video(task_id: str, _=Depends(auth)):
     return out
 
 
+# ------------------------- 成品拼接（服务端 ffmpeg） -------------------------
+class AssembleClip(BaseModel):
+    file: str                      # 媒体库文件名（仅文件名）
+    start: float | None = None     # 显式起点（秒），为空则自动
+    end: float | None = None       # 显式终点（秒），为空则自动
+
+
+class AssembleRequest(BaseModel):
+    clips: list[AssembleClip]
+    trim_silence: bool = True      # 自动剪掉每段首尾静音（保留少量余量）
+    speed: float = 1.0
+    timeout: int | None = None
+
+
+def _ffmpeg_exe() -> str | None:
+    import shutil
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _probe_media(ffmpeg: str, path: str) -> tuple[float, int, int]:
+    import subprocess
+    r = subprocess.run([ffmpeg, "-i", path], capture_output=True, text=True, timeout=60)
+    info = r.stderr or ""
+    dur = 0.0
+    m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", info)
+    if m:
+        dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    w = h = 0
+    m = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", info)
+    if m:
+        w, h = int(m.group(1)), int(m.group(2))
+    return dur, w, h
+
+
+def _silence_bounds(ffmpeg: str, path: str, duration: float) -> tuple[float, float]:
+    """建议裁剪区间：剪掉片头/片尾静音，片头保留 0.25s、片尾保留 0.35s 余量。"""
+    import subprocess
+    r = subprocess.run([ffmpeg, "-i", path, "-af",
+                        "silencedetect=noise=-50dB:d=0.5", "-f", "null", "-"],
+                       capture_output=True, text=True, timeout=120)
+    info = r.stderr or ""
+    events = [(m.group(1), float(m.group(2)))
+              for m in re.finditer(r"silence_(start|end): ([\d.]+)", info)]
+    start, end = 0.0, duration
+    if events and events[0][0] == "start" and events[0][1] <= 0.15:
+        for kind, val in events[1:]:
+            if kind == "end":
+                start = max(0.0, min(val - 0.25, 3.5))
+                break
+    starts = [v for k, v in events if k == "start"]
+    ends = [v for k, v in events if k == "end"]
+    if starts and len(starts) > len(ends):
+        tail_start = starts[-1]
+        if duration - tail_start > 0.6:
+            end = min(duration, tail_start + 0.35)
+    return start, end
+
+
+def _run_assemble(task_id: str, req: AssembleRequest):
+    import subprocess
+    try:
+        ffmpeg = _ffmpeg_exe()
+        if not ffmpeg:
+            store.update_task(task_id, status="failed",
+                              error="ffmpeg not available on bridge (install ffmpeg or imageio-ffmpeg)")
+            return
+        media_dir = CFG.media_dir
+        paths, dims = [], None
+        for c in req.clips:
+            raw = str(c.file or "").strip()
+            name = os.path.basename(raw)
+            if not name or name != raw or not name.lower().endswith((".mp4", ".webm", ".mov", ".mkv")):
+                raise ValueError(f"bad clip file name: {c.file!r}")
+            pth = os.path.join(media_dir, name)
+            if not os.path.isfile(pth):
+                raise ValueError(f"clip not found in media library: {name}")
+            paths.append(pth)
+            if dims is None:
+                _, w, h = _probe_media(ffmpeg, pth)
+                if w and h:
+                    dims = (w, h)
+        if dims is None:
+            dims = (720, 1280)
+        store.update_task(task_id, progress=30)
+        inputs, filters = [], []
+        for i, (c, pth) in enumerate(zip(req.clips, paths)):
+            dur, _, _ = _probe_media(ffmpeg, pth)
+            start = c.start if c.start is not None else 0.0
+            end = c.end if c.end is not None else dur
+            if req.trim_silence and dur > 0:
+                s2, e2 = _silence_bounds(ffmpeg, pth, dur)
+                if c.start is None:
+                    start = s2
+                if c.end is None:
+                    end = e2
+            if dur > 0 and end <= start:
+                start, end = 0.0, dur
+            inputs += ["-ss", f"{start:.2f}", "-to", f"{end:.2f}", "-i", pth]
+            filters.append(
+                f"[{i}:v]scale={dims[0]}:{dims[1]}:force_original_aspect_ratio=decrease,"
+                f"pad={dims[0]}:{dims[1]}:(ow-iw)/2:(oh-ih)/2,fps=24,setpts=PTS-STARTPTS[v{i}]")
+            filters.append(f"[{i}:a]aresample=48000,asetpts=PTS-STARTPTS[a{i}]")
+        store.update_task(task_id, progress=45)
+        n = len(paths)
+        chain = "".join(f"[v{i}][a{i}]" for i in range(n))
+        filters.append(f"{chain}concat=n={n}:v=1:a=1[cv][ca]")
+        speed = req.speed if req.speed and req.speed > 0 else 1.0
+        if abs(speed - 1.0) > 0.001:
+            filters.append(f"[cv]setpts=PTS/{speed}[outv]")
+            filters.append(f"[ca]atempo={speed}[outa]")
+        else:
+            filters.append("[cv]null[outv]")
+            filters.append("[ca]anull[outa]")
+        out_name = "asm_" + uuid.uuid4().hex[:16] + ".mp4"
+        out_path = os.path.join(media_dir, out_name)
+        cmd = [ffmpeg, "-y", *inputs, "-filter_complex", ";".join(filters),
+               "-map", "[outv]", "-map", "[outa]",
+               "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+               "-movflags", "+faststart", out_path]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=int(req.timeout or 1200))
+        if r.returncode != 0 or not os.path.isfile(out_path):
+            tail = (r.stderr or "")[-400:]
+            store.update_task(task_id, status="failed", error=f"ffmpeg failed: {tail}")
+            return
+        vurl = media_url(out_name)
+        store.update_task(task_id, status="completed", progress=100, url=vurl,
+                          result={"url": vurl, "filename": out_name,
+                                  "bytes": os.path.getsize(out_path), "kind": "video"})
+    except Exception as exc:  # noqa: BLE001
+        store.update_task(task_id, status="failed", error=str(exc))
+
+
+@app.post("/v1/assemble")
+async def create_assemble(req: AssembleRequest, _=Depends(auth)):
+    if not req.clips:
+        raise HTTPException(400, "clips 为空")
+    if len(req.clips) > 12:
+        raise HTTPException(400, "clips 最多 12 段")
+    task = store.create_task("assemble", f"assemble x{len(req.clips)}")
+    store.update_task(task["id"], progress=5)
+    threading.Thread(target=_run_assemble, args=(task["id"], req), daemon=True).start()
+    return {"id": task["id"], "task_id": task["id"], "object": "assemble.task",
+            "status": "queued", "progress": 5, "created_at": task["created_at"]}
+
+
+@app.get("/v1/assemble/{task_id}")
+def get_assemble(task_id: str, _=Depends(auth)):
+    t = store.get_task(task_id)
+    if not t:
+        raise HTTPException(404, "task 不存在")
+    out = dict(t)
+    if out.get("status") in ("succeeded", "success", "done"):
+        out["status"] = "completed"
+    return out
+
+
 # ------------------------- 对话（OpenAI 兼容） -------------------------
 def _sse(obj: dict) -> str:
     return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
