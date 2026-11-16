@@ -222,6 +222,21 @@ class MuseProxyError(MuseGenerationError):
     """The account's configured proxy failed; this is not Cookie invalidation."""
 
 
+class MuseSessionUnavailable(MuseGenerationError):
+    """/api/session returned 200 without an assigned workspace.
+
+    muse.ai may rotate hatch_sess / hatch_gw in that same response and revoke the old
+    values, so the merged cookies are carried here and callers must keep using them.
+    """
+
+    def __init__(self, message: str, cookies: dict | None = None,
+                 cookies_exp: dict | None = None, rotated: bool = False):
+        super().__init__(message)
+        self.cookies = cookies or {}
+        self.cookies_exp = cookies_exp or {}
+        self.rotated = rotated
+
+
 class MuseModelRefusalError(MuseGenerationError):
     """Muse completed the turn with text instead of the requested media."""
 
@@ -571,13 +586,24 @@ class MuseEngine:
                 sj = r.json()
             except ValueError:
                 raise MuseGenerationError("/api/session HTTP 200 返回非 JSON；会话状态未确认") from None
-            if not isinstance(sj, dict) or sj.get("status") != "assigned":
+            if not isinstance(sj, dict):
                 raise MuseGenerationError("/api/session HTTP 200 未返回 assigned 会话；请在官网检查账号/工作区状态")
+            # A genuine session answer may rotate credentials even when no workspace is
+            # assigned. Harvest Set-Cookie before evaluating the workspace status.
+            rotated = False
             for c in r.cookies:
                 if c.value:
+                    if cur_cookies.get(c.name) != c.value:
+                        rotated = True
                     cur_cookies[c.name] = c.value
                 if c.expires:
                     cur_exp[c.name] = int(float(c.expires))
+            if sj.get("status") != "assigned":
+                status = sj.get("status")
+                raise MuseSessionUnavailable(
+                    f"/api/session HTTP 200 未返回 assigned 会话（status={status}）；"
+                    f"工作区暂未分配，已保留 muse.ai 轮换下发的新 cookie",
+                    cur_cookies, cur_exp, rotated)
             vm_id = sj.get("vm_id")
             vm_state = sj.get("vm_state")
             wake_ok = False
@@ -593,12 +619,23 @@ class MuseEngine:
                     if proxy and rw.status_code == 407:
                         raise MuseProxyError("账号代理认证失败 (HTTP 407)，未完成 VM 唤醒")
                     wake_requested = rw.status_code == 200
+                    for c in rw.cookies:
+                        if c.value:
+                            cur_cookies[c.name] = c.value
+                        if c.expires:
+                            cur_exp[c.name] = int(float(c.expires))
+                    headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cur_cookies.items() if v)
                     if wake_requested:
                         # HTTP 200 acknowledges the request; only session state confirms the VM woke.
                         verify = requests.get("https://muse.ai/api/session", headers=headers,
                                               timeout=12, allow_redirects=False, **proxy_options)
                         if proxy and verify.status_code == 407:
                             raise MuseProxyError("账号代理认证失败 (HTTP 407)，未完成 VM 状态确认")
+                        for c in verify.cookies:
+                            if c.value:
+                                cur_cookies[c.name] = c.value
+                            if c.expires:
+                                cur_exp[c.name] = int(float(c.expires))
                         if verify.status_code == 200:
                             verified_session = verify.json()
                             if isinstance(verified_session, dict) and verified_session.get("status") == "assigned":
@@ -681,7 +718,6 @@ class MuseEngine:
     def _wait_ws_ready(self, page: CDP, timeout: float = 15.0) -> bool:
         """等待 muse.ai 页面完成 React hydration 且不再处于 Connecting... 状态。"""
         deadline = time.time() + timeout
-        last_fix = 0.0
         while time.time() < deadline:
             try:
                 st = page.js("""(function(){
@@ -697,21 +733,6 @@ class MuseEngine:
                 })()""")
                 if st == "ready":
                     return True
-                if st == "no-ta" and time.time() - last_fix > 3.0:
-                    # [PATCH v4] muse.ai sometimes serves its own error
-                    # boundary ("Something went wrong" / "Try again") instead
-                    # of the chat UI. Click Try again (or reload) and keep
-                    # waiting instead of timing out on a dead page.
-                    last_fix = time.time()
-                    page.js("""(function(){
-                        var b = document.body ? (document.body.innerText || '') : '';
-                        if (b.indexOf('Something went wrong') === -1) return 0;
-                        var els = [...document.querySelectorAll('button, a, [role="button"]')];
-                        var t = els.find(function(e){ return (e.innerText || '').trim().indexOf('Try again') !== -1; });
-                        if (t) { t.click(); return 1; }
-                        location.reload();
-                        return 2;
-                    })()""")
             except Exception:
                 pass
             time.sleep(0.1)
@@ -745,7 +766,7 @@ class MuseEngine:
             })(%s)""" % ("true" if for_chat else "false"))
             if needs_nav:
                 self.page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
-                t_end = time.time() + 30.0
+                t_end = time.time() + 10.0
                 while time.time() < t_end:
                     time.sleep(0.08)
                     ready = self.page.js("""(function(){
@@ -755,9 +776,21 @@ class MuseEngine:
                     })()""")
                     if ready:
                         break
-                self._wait_ws_ready(self.page, timeout=30.0)
+                self._wait_ws_ready(self.page, timeout=12.0)
         except Exception:
             pass
+
+    # Set by the app: persist cookies that muse.ai rotated during an engine-side renewal.
+    cookie_sink = None
+
+    def _report_rotated_cookies(self, account_id, cookies: dict, expires: dict | None):
+        sink = self.cookie_sink
+        if not (sink and account_id and cookies):
+            return
+        try:
+            sink(account_id, dict(cookies), dict(expires or {}))
+        except Exception as e:  # noqa: BLE001
+            log.warning("保存轮换后的 cookie 失败 %s: %s", account_id, e)
 
     def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
         resolver = getattr(self, "proxy_resolver", None)
@@ -792,6 +825,16 @@ class MuseEngine:
                     last_map[account_id] = now_ts
             except (MuseAuthError, MuseProxyError):
                 raise
+            except MuseSessionUnavailable as e:
+                if e.cookies:
+                    cookies = e.cookies
+                    expires = e.cookies_exp or expires
+                    if e.rotated:
+                        self._report_rotated_cookies(account_id, cookies, expires)
+                if account_id:
+                    last_map[account_id] = now_ts
+                log.warning("预续签 /api/session 未分配工作区（继续用%s cookie 加载页面）: %s",
+                            "轮换后的新" if e.rotated else "现有", e)
             except Exception as e:
                 log.warning("预续签 /api/session 失败（继续尝试浏览器加载）: %s", e)
 
@@ -1078,60 +1121,7 @@ class MuseEngine:
         "b.click();return 'clicked';})()"
     )
 
-    def _page_diag(self) -> str:
-        """[PATCH v2] Compact page-state snapshot for failure diagnosis."""
-        try:
-            out = self.page.js("""(function(){
-                var ta = document.querySelector('textarea');
-                var h = document.querySelector('[data-hatch-shell-hydration-state]');
-                var st = 'unknown';
-                if (document.readyState !== 'complete') st = 'loading';
-                else if (!ta) st = 'no-ta';
-                else if (h && h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') st = 'hydrating';
-                else if ((document.body ? (document.body.innerText || '') : '').indexOf('Connecting...') !== -1) st = 'connecting';
-                else if (ta.disabled) st = 'input-disabled';
-                else st = 'ready';
-                return JSON.stringify({
-                    url: location.href, title: document.title, state: st,
-                    body: (document.body ? (document.body.innerText || '') : '').slice(0, 300)
-                });
-            })()""")
-            return str(out)[:600]
-        except Exception as e:
-            return "diag-failed: %s" % e
-
     def _send(self, prompt: str):
-        # 0. 先等页面真正就绪：慢速机器上页面会重挂载，单次查询必漏。
-        #    复用 _wait_ws_ready 的完整就绪判定（textarea 存在 + 已水合 + 非 Connecting + 可用）。
-        try:
-            _send_wait = float(os.environ.get("MUSE2API_SEND_WAIT", "90"))
-        except (TypeError, ValueError):
-            _send_wait = 90.0
-        if not self._wait_ws_ready(self.page, timeout=_send_wait):
-            # [PATCH v3] Snapshot the stuck state to the service log
-            # (Render Logs) before attempting recovery.
-            try:
-                log.warning("SEND-WAIT-EXPIRED diag: %s", self._page_diag())
-            except Exception:
-                pass
-            # [PATCH v2] One self-recovery attempt: re-navigate to a fresh
-            # thread and wait again before giving up.
-            try:
-                self.page.send("Page.navigate",
-                               {"url": "https://muse.ai/thread/new"})
-            except Exception:
-                pass
-            if not self._wait_ws_ready(self.page, timeout=60.0):
-                # [PATCH v3] The panel translates the stock Chinese error
-                # string into a canned label and drops any suffix, so log
-                # the snapshot (Render Logs) and raise with a unique text
-                # that passes through the panel untranslated.
-                _diag = self._page_diag()
-                try:
-                    log.warning("SEND-NOT-READY diag: %s", _diag)
-                except Exception:
-                    pass
-                raise MuseGenerationError("send-not-ready :: " + _diag)
         # 1. 确保 textarea 滚动到视口中央并获得真实焦点
         try:
             self.page.js("""(function(){
@@ -1567,17 +1557,28 @@ class MuseEngine:
 
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
-                    stop_event=None):
+                    stop_event=None, images: list[str] | None = None):
         """发一条消息，流式 yield 增量文本。"""
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
         self.ensure_page(cookies, expires, account_id=account_id)
-        self.reset_thread(for_chat=True)
+        # 带图对话必须强制新会话：热会话复用会串入旧上下文（实测旧产品分析会被原样复读），
+        # 且附件要落在干净的输入框里；纯文本对话保持原有的热会话秒回路径。
+        self.reset_thread(for_chat=not images)
         base_agent, base_text, _ = self._poll_chat()
+        upload = self._attach_images(images) if images else None
+        try:
+            yield from self._chat_reply_tail(prompt, base_agent, base_text, timeout, stop_event)
+        finally:
+            if upload:
+                shutil.rmtree(upload["dir"], ignore_errors=True)
+
+    def _chat_reply_tail(self, prompt: str, base_agent, base_text, timeout: int, stop_event=None):
+        """发送提示词并流式收集助手文本回复（原 chat_stream 后半段，逻辑不变）。"""
         self._send(prompt)
 
         t_sent = time.time()
         deadline = t_sent + timeout
-        first_token_deadline = min(deadline, t_sent + float(os.environ.get("MUSE2API_FIRST_TOKEN_TIMEOUT", "180")))
+        first_token_deadline = min(deadline, t_sent + 40.0)
         sent, last, stable = "", None, 0
         got_first = False
 
@@ -1635,10 +1636,12 @@ class MuseEngine:
         raise MuseGenerationError("等待助手回复超时")
 
     def chat(self, cookies: dict, prompt: str, expires: dict | None = None,
-             timeout: int | None = None, account_id: str | None = None) -> str:
+             timeout: int | None = None, account_id: str | None = None,
+             images: list[str] | None = None) -> str:
         """发一条消息，返回完整回复文本（非流式）。"""
         out = ""
-        for chunk in self.chat_stream(cookies, prompt, expires, timeout, account_id=account_id):
+        for chunk in self.chat_stream(cookies, prompt, expires, timeout, account_id=account_id,
+                                      images=images):
             out += chunk
         return out
 
@@ -1946,18 +1949,6 @@ class MuseEngine:
             raise MuseGenerationError("任务准备超时，已停止发送")
         if self._send(prompt) not in ("clicked", "enter-sent"):
             raise MuseGenerationError("提示词发送未确认，已停止生成")
-        # [PATCH v4] The slow early stages may have eaten most of the task
-        # budget; guarantee the result stage its own wait window, and log
-        # the page state right after the confirmed send.
-        try:
-            _rw = float(os.environ.get("MUSE2API_RESULT_WAIT", "300"))
-        except (TypeError, ValueError):
-            _rw = 300.0
-        deadline = max(deadline, time.monotonic() + _rw)
-        try:
-            log.warning("SEND-OK state: %s", self._page_diag())
-        except Exception:
-            pass
         os.makedirs(self.cfg.media_dir, exist_ok=True)
         # 页面若把刚上传的素材渲染成"结果"，按哈希识别出来并继续等待真正的成品
         while time.monotonic() < deadline:
@@ -1970,10 +1961,6 @@ class MuseEngine:
             )
             if not att:
                 self._debug_dump("no-attachment")
-                try:
-                    log.warning("NO-RESULT state: %s", self._page_diag())
-                except Exception:
-                    pass
                 raise MuseGenerationError("等待生成超时，未出现新的生成结果")
 
             data = mime = url = None

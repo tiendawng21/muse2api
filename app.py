@@ -394,7 +394,8 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 
 
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
-                     timeout: int, account_id: str | None, pinned: bool = False):
+                     timeout: int, account_id: str | None, pinned: bool = False,
+                     images: list[str] | None = None):
     """Acquire a generation slot before the account lease; release both after cleanup."""
     import queue
     q = queue.Queue(maxsize=100)
@@ -450,7 +451,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     engine.start()
                     for chunk in engine.chat_stream(
                         cur_cookies, prompt, cur_exp, timeout,
-                        account_id=cur_id, stop_event=stop_event
+                        account_id=cur_id, stop_event=stop_event, images=images
                     ):
                         yielded = True
                         q.put(("data", chunk))
@@ -806,6 +807,30 @@ def _content_text(content) -> str:
                 parts.append(item)
         return "\n".join(p for p in parts if p)
     return str(content)
+
+
+def _extract_chat_images(messages) -> list[str]:
+    """从 OpenAI 多模态 messages 中提取图片引用（data URI 或 URL）。
+
+    引擎的文本拼接会把 image_url 压成「[图片]」占位符——模型看不到图。
+    这里把原图单独挑出来，交给引擎在发送前真实附加到输入框，模型才能看图。
+    """
+    out: list[str] = []
+    for m in messages or []:
+        content = getattr(m, "content", None)
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in ("image_url", "input_image", "image"):
+                v = item.get("image_url") or item.get("url") or item.get("image") or ""
+                if isinstance(v, dict):
+                    v = v.get("url") or ""
+                v = str(v or "").strip()
+                if v:
+                    out.append(v)
+    return out
 
 
 def build_chat_prompt(messages: list[ChatMessage]) -> str:
@@ -1672,6 +1697,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
     prompt = build_chat_prompt(req.messages) or (req.prompt or "").strip()
     if not prompt:
         raise HTTPException(400, "messages 为空")
+    chat_images = _extract_chat_images(req.messages)
 
     # 工具调用协议默认不注入 —— 实测 muse.ai 的助手会明确拒绝输出"伪工具调用"，
     # 注入反而污染正常回答；详见 config.py 的 tool_protocol 注释。
@@ -1709,7 +1735,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                 # 握手建立瞬间立即发送 role: assistant 首包，让下游客户端秒级捕获光标
                 yield _sse(_chat_chunk(cid, created, model, {"role": "assistant"}))
 
-                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, pinned=bool(_pinned_id))
+                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, pinned=bool(_pinned_id), images=chat_images)
                 if not tool_note:
                     for chunk in stream_gen:
                         for piece in _pace_text(chunk):
@@ -1771,7 +1797,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, pinned=bool(_pinned_id)))
+        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, pinned=bool(_pinned_id), images=chat_images))
 
     try:
         text = await asyncio.to_thread(run)
