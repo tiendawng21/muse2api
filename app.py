@@ -1791,6 +1791,45 @@ async def create_assemble(req: AssembleRequest, _=Depends(auth)):
             "status": "queued", "progress": 5, "created_at": task["created_at"]}
 
 
+class FrameRequest(BaseModel):
+    file: str                      # 媒体库中的视频文件名
+    at: str = "end"                # "end" 或秒数
+    back: float = 0.15             # 距结尾回退秒数（避开尾帧黑场）
+
+
+@app.post("/v1/frame")
+def extract_frame(req: FrameRequest, _=Depends(auth)):
+    """截取视频某一帧为 JPG 存入媒体库（用于片段间首尾衔接）。"""
+    import subprocess
+    ffmpeg = _ffmpeg_exe()
+    if not ffmpeg:
+        raise HTTPException(500, "ffmpeg not available on bridge")
+    raw = str(req.file or "").strip()
+    name = os.path.basename(raw)
+    if not name or name != raw or not name.lower().endswith((".mp4", ".webm", ".mov", ".mkv")):
+        raise HTTPException(400, "bad file name")
+    srcp = os.path.join(CFG.media_dir, name)
+    if not os.path.isfile(srcp):
+        raise HTTPException(404, "clip not found in media library")
+    dur, _, _ = _probe_media(ffmpeg, srcp)
+    if str(req.at) == "end":
+        t = max(0.0, dur - 0.15 - (req.back or 0.0)) if dur > 0 else 0.0
+    else:
+        try:
+            t = float(req.at)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "bad 'at' value")
+    out_name = "frm_" + uuid.uuid4().hex[:16] + ".jpg"
+    out_path = os.path.join(CFG.media_dir, out_name)
+    r = subprocess.run([ffmpeg, "-y", "-ss", f"{t:.2f}", "-i", srcp,
+                        "-frames:v", "1", "-q:v", "3", out_path],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0 or not os.path.isfile(out_path):
+        raise HTTPException(500, "ffmpeg frame extract failed")
+    return {"url": media_url(out_name), "filename": out_name,
+            "kind": "image", "at": t, "duration": dur}
+
+
 @app.get("/v1/assemble/{task_id}")
 def get_assemble(task_id: str, _=Depends(auth)):
     t = store.get_task(task_id)
