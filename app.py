@@ -1841,6 +1841,80 @@ def get_assemble(task_id: str, _=Depends(auth)):
     return out
 
 
+# ------------------------- Flow 任务（服务端代跑 flow2api，支持后台生成） -------------------------
+FLOW_LOCAL_BASE = os.environ.get("FLOW_LOCAL_BASE", "http://127.0.0.1:8000").rstrip("/")
+
+class FlowTaskRequest(BaseModel):
+    kind: str = "image"            # "image" | "video"
+    model: str = ""                # flow2api 模型名，如 gemini-3.1-flash-image-portrait / omni-1.1-flash-10s-portrait
+    prompt: str = ""
+    images: list = []              # data URI 或 http(s) URL
+    flow_key: str = ""             # app 传入的 flow2api key，仅随请求对象在内存中使用，不落盘
+
+def _flow_extract_url(kind: str, content: str) -> str:
+    if kind == "image":
+        m = re.search(r"\((https?://[^)\s]+)\)", content or "")
+        return m.group(1) if m else ""
+    m = re.search(r"src='(https?://[^']+)'", content or "") or re.search(r'src="(https?://[^"]+)"', content or "")
+    return m.group(1) if m else ""
+
+def _run_flow_task(task_id: str, req: FlowTaskRequest):
+    import urllib.request, urllib.error
+    try:
+        store.update_task(task_id, status="processing", progress=10)
+        content = [{"type": "text", "text": req.prompt}]
+        for u in (req.images or [])[:5]:
+            if u:
+                content.append({"type": "image_url", "image_url": {"url": u}})
+        body = json.dumps({"model": req.model, "stream": False,
+                           "messages": [{"role": "user", "content": content}]}).encode("utf-8")
+        timeout = 600 if req.kind == "video" else 360
+        r = urllib.request.Request(FLOW_LOCAL_BASE + "/v1/chat/completions", data=body, method="POST",
+                                   headers={"Content-Type": "application/json",
+                                            "Authorization": "Bearer " + (req.flow_key or "")})
+        try:
+            with urllib.request.urlopen(r, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:300]
+            raise RuntimeError(f"flow2api HTTP {e.code}: {detail}")
+        if isinstance(data, dict) and data.get("error"):
+            err = data["error"]
+            raise RuntimeError("flow2api: " + str(err.get("message") if isinstance(err, dict) else err))
+        choices = (data or {}).get("choices") or []
+        text = ((choices[0].get("message") or {}).get("content") if choices else "") or ""
+        url = _flow_extract_url(req.kind, text)
+        if not url:
+            raise RuntimeError("flow2api did not return a result URL: " + text[:200])
+        store.update_task(task_id, status="completed", progress=100,
+                          result={"url": url, "kind": req.kind})
+    except Exception as e:
+        store.update_task(task_id, status="failed", error=str(e)[:500])
+
+@app.post("/v1/flow/tasks")
+async def create_flow_task(req: FlowTaskRequest, _=Depends(auth)):
+    if req.kind not in ("image", "video"):
+        raise HTTPException(400, "kind must be image|video")
+    if not req.model or not req.prompt:
+        raise HTTPException(400, "model/prompt required")
+    if not req.flow_key:
+        raise HTTPException(400, "flow_key required")
+    task = store.create_task("flow-" + req.kind, req.prompt[:120])
+    threading.Thread(target=_run_flow_task, args=(task["id"], req), daemon=True).start()
+    return {"id": task["id"], "task_id": task["id"], "object": "flow.task",
+            "status": "queued", "created_at": task["created_at"]}
+
+@app.get("/v1/flow/tasks/{task_id}")
+def get_flow_task(task_id: str, _=Depends(auth)):
+    t = store.get_task(task_id)
+    if not t or not str(t.get("kind", "")).startswith("flow-"):
+        raise HTTPException(404, "task not found")
+    return {"id": t["id"], "object": "flow.task", "kind": t.get("kind"),
+            "status": t.get("status"), "progress": t.get("progress"),
+            "result": t.get("result"), "error": t.get("error"),
+            "created_at": t.get("created_at"), "updated_at": t.get("updated_at")}
+
+
 # ------------------------- 对话（OpenAI 兼容） -------------------------
 def _sse(obj: dict) -> str:
     return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
