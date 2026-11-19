@@ -1952,7 +1952,7 @@ def _run_flow_task(task_id: str, req: FlowTaskRequest):
                 content.append({"type": "image_url", "image_url": {"url": u}})
         body = json.dumps({"model": req.model, "stream": False,
                            "messages": [{"role": "user", "content": content}]}).encode("utf-8")
-        timeout = 600 if req.kind == "video" else 360
+        timeout = 300 if req.kind == "video" else 360
         r = urllib.request.Request(FLOW_LOCAL_BASE + "/v1/chat/completions", data=body, method="POST",
                                    headers={"Content-Type": "application/json",
                                             "Authorization": "Bearer " + (req.flow_key or "")})
