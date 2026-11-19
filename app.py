@@ -1998,6 +1998,65 @@ def get_flow_task(task_id: str, _=Depends(auth)):
             "result": t.get("result"), "error": t.get("error"),
             "created_at": t.get("created_at"), "updated_at": t.get("updated_at")}
 
+# ------------------------- Flow warmup (captcha score-test, V9.4) -------------------------
+# App bam "Lam nong Flow" -> cau dang nhap admin flow2api (localhost) -> goi score-test:
+# flow2api giai that 1 captcha bang phuong thuc dang dung (personal/browser) de cac tab
+# thuong tru am len, KHONG gen anh/video nen khong ton credit Flow.
+FLOW_ADMIN_USER = os.environ.get("FLOW_ADMIN_USER", "admin")
+FLOW_ADMIN_PASS = os.environ.get("FLOW_ADMIN_PASS", "admin")
+_flow_admin_token = {"value": "", "at": 0.0}
+
+def _flow_admin_login() -> str:
+    import urllib.request, urllib.error
+    body = json.dumps({"username": FLOW_ADMIN_USER, "password": FLOW_ADMIN_PASS}).encode("utf-8")
+    r = urllib.request.Request(FLOW_LOCAL_BASE + "/api/admin/login", data=body, method="POST",
+                               headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(r, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:200]
+        raise RuntimeError(f"flow2api admin login HTTP {e.code}: {detail}")
+    token = (data or {}).get("token") or ""
+    if not token:
+        raise RuntimeError("flow2api admin login khong tra token")
+    _flow_admin_token["value"] = token
+    _flow_admin_token["at"] = time.time()
+    return token
+
+def _flow_score_test(token: str) -> dict:
+    import urllib.request, urllib.error
+    r = urllib.request.Request(FLOW_LOCAL_BASE + "/api/captcha/score-test", data=b"{}", method="POST",
+                               headers={"Content-Type": "application/json",
+                                        "Authorization": "Bearer " + token})
+    try:
+        with urllib.request.urlopen(r, timeout=180) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:300]
+        if e.code == 401:
+            raise PermissionError("flow2api admin token het han")
+        raise RuntimeError(f"flow2api score-test HTTP {e.code}: {detail}")
+
+@app.post("/v1/flow/warmup")
+def flow_warmup(_=Depends(auth)):
+    try:
+        token = _flow_admin_token["value"]
+        if not token or time.time() - _flow_admin_token["at"] > 3600:
+            token = _flow_admin_login()
+        try:
+            data = _flow_score_test(token)
+        except PermissionError:
+            token = _flow_admin_login()
+            data = _flow_score_test(token)
+    except Exception as e:
+        raise HTTPException(502, "Lam nong Flow that bai: " + str(e)[:300])
+    ok = bool(data.get("success")) and bool(data.get("token_acquired", True))
+    return {"ok": ok, "score": data.get("score"), "method": data.get("captcha_method"),
+            "elapsed_ms": data.get("elapsed_ms"), "token_elapsed_ms": data.get("token_elapsed_ms"),
+            "message": data.get("message") or ""}
+
+
 
 # ------------------------- 对话（OpenAI 兼容） -------------------------
 def _sse(obj: dict) -> str:
