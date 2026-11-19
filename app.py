@@ -1702,6 +1702,26 @@ def _silence_bounds(ffmpeg: str, path: str, duration: float) -> tuple[float, flo
     return start, end
 
 
+def _has_audio(ffmpeg, path):
+    import subprocess
+    try:
+        r = subprocess.run([ffmpeg, "-i", path], capture_output=True, text=True, timeout=30)
+        return "Audio:" in (r.stderr or "")
+    except Exception:
+        return True  # không chắc thì giữ hành vi cũ
+
+def _pad_silent_audio(ffmpeg, src, media_dir):
+    """Tạo bản sao clip có thêm rãnh audio im lặng (cho clip không có tiếng) để ghép không lỗi."""
+    import subprocess
+    out = os.path.join(media_dir, "pad_" + uuid.uuid4().hex[:12] + ".mp4")
+    r = subprocess.run([ffmpeg, "-y", "-i", src, "-f", "lavfi", "-i", "anullsrc=cl=stereo:r=48000",
+                        "-map", "0:v", "-map", "1:a", "-shortest", "-c:v", "copy",
+                        "-c:a", "aac", "-b:a", "128k", out],
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0 or not os.path.isfile(out):
+        raise ValueError("cannot pad silent audio for clip")
+    return out
+
 def _run_assemble(task_id: str, req: AssembleRequest):
     import subprocess
     try:
@@ -1727,6 +1747,12 @@ def _run_assemble(task_id: str, req: AssembleRequest):
                     dims = (w, h)
         if dims is None:
             dims = (720, 1280)
+        padded = []
+        for i, pth in enumerate(paths):
+            if not _has_audio(ffmpeg, pth):
+                npth = _pad_silent_audio(ffmpeg, pth, media_dir)
+                padded.append(npth)
+                paths[i] = npth
         store.update_task(task_id, progress=30)
         inputs, filters = [], []
         for i, (c, pth) in enumerate(zip(req.clips, paths)):
@@ -1766,6 +1792,9 @@ def _run_assemble(task_id: str, req: AssembleRequest):
                "-movflags", "+faststart", out_path]
         r = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=int(req.timeout or 1200))
+        for pth in padded:
+            try: os.unlink(pth)
+            except OSError: pass
         if r.returncode != 0 or not os.path.isfile(out_path):
             tail = (r.stderr or "")[-400:]
             store.update_task(task_id, status="failed", error=f"ffmpeg failed: {tail}")
@@ -1775,6 +1804,9 @@ def _run_assemble(task_id: str, req: AssembleRequest):
                           result={"url": vurl, "filename": out_name,
                                   "bytes": os.path.getsize(out_path), "kind": "video"})
     except Exception as exc:  # noqa: BLE001
+        for pth in (padded if 'padded' in locals() else []):
+            try: os.unlink(pth)
+            except OSError: pass
         store.update_task(task_id, status="failed", error=str(exc))
 
 
@@ -1828,6 +1860,58 @@ def extract_frame(req: FrameRequest, _=Depends(auth)):
         raise HTTPException(500, "ffmpeg frame extract failed")
     return {"url": media_url(out_name), "filename": out_name,
             "kind": "image", "at": t, "duration": dur}
+
+
+class MediaImportRequest(BaseModel):
+    url: str = ""                # URL file media (vd clip do Flow trả về)
+
+@app.post("/v1/media/import")
+def import_media(req: MediaImportRequest, _=Depends(auth)):
+    """Tải 1 file media từ URL về thư viện media của cầu (để ghép/nối khung như clip Muse)."""
+    import urllib.request
+    u = (req.url or "").strip()
+    if not u.lower().startswith(("http://", "https://")):
+        raise HTTPException(400, "url must be http(s)")
+    ext = ".mp4"
+    path_part = u.split("?")[0].lower()
+    for e in (".mp4", ".webm", ".mov", ".mkv"):
+        if path_part.endswith(e):
+            ext = e
+            break
+    name = "imp_" + uuid.uuid4().hex[:16] + ext
+    dest = os.path.join(CFG.media_dir, name)
+    try:
+        r = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0 (muse2api media import)"})
+        total = 0
+        with urllib.request.urlopen(r, timeout=180) as resp, open(dest, "wb") as f:
+            while True:
+                chunk = resp.read(1024 * 512)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 300 * 1024 * 1024:
+                    f.close()
+                    try: os.unlink(dest)
+                    except OSError: pass
+                    raise HTTPException(413, "file too large (>300MB)")
+                f.write(chunk)
+    except HTTPException:
+        raise
+    except Exception as e:
+        try: os.unlink(dest)
+        except OSError: pass
+        raise HTTPException(502, f"download failed: {str(e)[:200]}")
+    if not os.path.isfile(dest) or os.path.getsize(dest) == 0:
+        raise HTTPException(502, "downloaded file is empty")
+    dur, w, h = 0, 0, 0
+    ffmpeg = _ffmpeg_exe()
+    if ffmpeg:
+        try:
+            dur, w, h = _probe_media(ffmpeg, dest)
+        except Exception:
+            pass
+    return {"url": media_url(name), "filename": name, "kind": "video",
+            "size": os.path.getsize(dest), "duration": dur, "width": w, "height": h}
 
 
 @app.get("/v1/assemble/{task_id}")
