@@ -2056,6 +2056,39 @@ def flow_warmup(_=Depends(auth)):
             "elapsed_ms": data.get("elapsed_ms"), "token_elapsed_ms": data.get("token_elapsed_ms"),
             "message": data.get("message") or ""}
 
+def _flow_tokens(token: str) -> list:
+    import urllib.request, urllib.error
+    r = urllib.request.Request(FLOW_LOCAL_BASE + "/api/tokens", method="GET",
+                               headers={"Authorization": "Bearer " + token})
+    try:
+        with urllib.request.urlopen(r, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:300]
+        if e.code == 401:
+            raise PermissionError("flow2api admin token het han")
+        raise RuntimeError(f"flow2api tokens HTTP {e.code}: {detail}")
+    if isinstance(data, dict):
+        data = data.get("tokens") or data.get("data") or []
+    return data if isinstance(data, list) else []
+
+@app.get("/v1/flow/lanes")
+def flow_lanes(_=Depends(auth)):
+    # V9.5: app hien thi so lan Flow dang bat tren hang trang thai cau hinh.
+    try:
+        token = _flow_admin_token["value"]
+        if not token or time.time() - _flow_admin_token["at"] > 3600:
+            token = _flow_admin_login()
+        try:
+            toks = _flow_tokens(token)
+        except PermissionError:
+            token = _flow_admin_login()
+            toks = _flow_tokens(token)
+    except Exception as e:
+        raise HTTPException(502, "Doc be Flow that bai: " + str(e)[:300])
+    enabled = sum(1 for t in toks if isinstance(t, dict) and t.get("is_active"))
+    return {"ok": True, "total": len(toks), "enabled": enabled}
+
 
 
 # ------------------------- 对话（OpenAI 兼容） -------------------------
