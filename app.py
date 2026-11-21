@@ -1682,23 +1682,23 @@ def _silence_bounds(ffmpeg: str, path: str, duration: float) -> tuple[float, flo
     """建议裁剪区间：剪掉片头/片尾静音，片头保留 0.25s、片尾保留 0.35s 余量。"""
     import subprocess
     r = subprocess.run([ffmpeg, "-i", path, "-af",
-                        "silencedetect=noise=-50dB:d=0.5", "-f", "null", "-"],
+                        "silencedetect=noise=-38dB:d=0.35", "-f", "null", "-"],
                        capture_output=True, text=True, timeout=120)
     info = r.stderr or ""
     events = [(m.group(1), float(m.group(2)))
               for m in re.finditer(r"silence_(start|end): ([\d.]+)", info)]
     start, end = 0.0, duration
-    if events and events[0][0] == "start" and events[0][1] <= 0.15:
+    if events and events[0][0] == "start" and events[0][1] <= 0.30:
         for kind, val in events[1:]:
             if kind == "end":
-                start = max(0.0, min(val - 0.25, 3.5))
+                start = max(0.0, min(val - 0.20, 3.5))
                 break
     starts = [v for k, v in events if k == "start"]
     ends = [v for k, v in events if k == "end"]
     if starts and len(starts) > len(ends):
         tail_start = starts[-1]
-        if duration - tail_start > 0.6:
-            end = min(duration, tail_start + 0.35)
+        if duration - tail_start > 0.5:
+            end = min(duration, tail_start + 0.30)
     return start, end
 
 
@@ -1755,6 +1755,7 @@ def _run_assemble(task_id: str, req: AssembleRequest):
                 paths[i] = npth
         store.update_task(task_id, progress=30)
         inputs, filters = [], []
+        trims = []
         for i, (c, pth) in enumerate(zip(req.clips, paths)):
             dur, _, _ = _probe_media(ffmpeg, pth)
             start = c.start if c.start is not None else 0.0
@@ -1767,6 +1768,8 @@ def _run_assemble(task_id: str, req: AssembleRequest):
                     end = e2
             if dur > 0 and end <= start:
                 start, end = 0.0, dur
+            trims.append({"i": i + 1, "start": round(float(start), 2),
+                          "end": round(float(end), 2), "dur": round(float(dur), 2)})
             inputs += ["-ss", f"{start:.2f}", "-to", f"{end:.2f}", "-i", pth]
             filters.append(
                 f"[{i}:v]scale={dims[0]}:{dims[1]}:force_original_aspect_ratio=decrease,"
@@ -1802,7 +1805,8 @@ def _run_assemble(task_id: str, req: AssembleRequest):
         vurl = media_url(out_name)
         store.update_task(task_id, status="completed", progress=100, url=vurl,
                           result={"url": vurl, "filename": out_name,
-                                  "bytes": os.path.getsize(out_path), "kind": "video"})
+                                  "bytes": os.path.getsize(out_path), "kind": "video",
+                                  "trims": trims})
     except Exception as exc:  # noqa: BLE001
         for pth in (padded if 'padded' in locals() else []):
             try: os.unlink(pth)
