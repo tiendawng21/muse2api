@@ -1644,11 +1644,27 @@ class AssembleClip(BaseModel):
     end: float | None = None       # 显式终点（秒），为空则自动
 
 
+class SubtitleCue(BaseModel):
+    seg: int = 0                   # chi so clip trong clips[] (0-based)
+    start: float = 0.0             # giay, theo timeline GOC cua doan (truoc cat lang)
+    end: float = 0.0
+    text: str = ""
+
+
+class SubtitleSpec(BaseModel):
+    enabled: bool = True
+    size: str = "vua"              # nho | vua | lon
+    position: str = "duoi"         # duoi | giua | tren
+    style: str = "tiktok"          # tiktok | phim | vang
+    cues: list[SubtitleCue] = []
+
+
 class AssembleRequest(BaseModel):
     clips: list[AssembleClip]
     trim_silence: bool = True      # 自动剪掉每段首尾静音（保留少量余量）
     speed: float = 1.0
     timeout: int | None = None
+    subtitles: SubtitleSpec | None = None
 
 
 def _ffmpeg_exe() -> str | None:
@@ -1693,12 +1709,18 @@ def _silence_bounds(ffmpeg: str, path: str, duration: float) -> tuple[float, flo
             if kind == "end":
                 start = max(0.0, min(val - 0.20, 3.5))
                 break
-    starts = [v for k, v in events if k == "start"]
-    ends = [v for k, v in events if k == "end"]
-    if starts and len(starts) > len(ends):
-        tail_start = starts[-1]
-        if duration - tail_start > 0.5:
-            end = min(duration, tail_start + 0.30)
+    ivs, cur = [], None
+    for kind, val in events:
+        if kind == "start":
+            cur = val
+        elif kind == "end" and cur is not None:
+            ivs.append((cur, val)); cur = None
+    if cur is not None:
+        ivs.append((cur, duration))
+    if ivs:
+        ls, le = ivs[-1]
+        if le >= duration - 0.05 and duration - ls > 0.5:
+            end = min(duration, ls + 0.30)
     return start, end
 
 
@@ -1721,6 +1743,46 @@ def _pad_silent_audio(ffmpeg, src, media_dir):
     if r.returncode != 0 or not os.path.isfile(out):
         raise ValueError("cannot pad silent audio for clip")
     return out
+
+def _ass_time(t: float) -> str:
+    t = max(0.0, float(t))
+    h = int(t // 3600); m = int((t % 3600) // 60); s = t % 60
+    return f"{h}:{m:02d}:{s:05.2f}"
+
+
+def _ass_escape(text: str) -> str:
+    import textwrap
+    t = " ".join(str(text or "").replace("{", "").replace("}", "").split())
+    if not t:
+        return ""
+    lines = textwrap.wrap(t, width=30)[:2]
+    if len(textwrap.wrap(t, width=30)) > 2:
+        lines[1] = lines[1].rstrip(" .,") + "…"
+    return "\\N".join(lines)
+
+
+def _build_ass(cues, w: int, h: int, size: str, position: str, style: str) -> str:
+    fs = max(24, int(h * {"nho": 0.030, "vua": 0.040, "lon": 0.052}.get(size, 0.040)))
+    if style == "vang":
+        primary, bold, ow = "&H0000FFFF", 1, max(2.0, fs * 0.08)
+    elif style == "phim":
+        primary, bold, ow = "&H00FFFFFF", 0, max(1.0, fs * 0.045)
+    else:  # tiktok
+        primary, bold, ow = "&H00FFFFFF", 1, max(2.0, fs * 0.10)
+    align, mv = {"duoi": (2, int(h * 0.09)), "giua": (5, 0), "tren": (8, int(h * 0.05))}.get(position, (2, int(h * 0.09)))
+    head = ("[Script Info]\nScriptType: v4.00+\nPlayResX: %d\nPlayResY: %d\nWrapStyle: 2\n\n"
+            "[V4+ Styles]\n"
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+            "Style: TD,DejaVu Sans,%d,%s,&H000000FF,&H00000000,&H64000000,%d,0,0,0,100,100,0,0,1,%.1f,0,%d,24,24,%d,1\n\n"
+            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            % (w, h, fs, primary, bold, ow, align, mv))
+    ev = []
+    for (gs, ge, text) in cues:
+        t = _ass_escape(text)
+        if t and ge > gs:
+            ev.append(f"Dialogue: 0,{_ass_time(gs)},{_ass_time(ge)},TD,,0,0,0,,{t}")
+    return head + "\n".join(ev) + "\n"
+
 
 def _run_assemble(task_id: str, req: AssembleRequest):
     import subprocess
@@ -1802,11 +1864,55 @@ def _run_assemble(task_id: str, req: AssembleRequest):
             tail = (r.stderr or "")[-400:]
             store.update_task(task_id, status="failed", error=f"ffmpeg failed: {tail}")
             return
+        sub_info = None
+        spec = getattr(req, "subtitles", None)
+        if spec is not None and spec.enabled and spec.cues:
+            try:
+                offs, acc = [], 0.0
+                for tr in trims:
+                    ln = max(0.0, float(tr["end"]) - float(tr["start"]))
+                    offs.append((acc, float(tr["start"]), ln))
+                    acc += ln
+                gcues = []
+                for cue in spec.cues:
+                    if cue.seg < 0 or cue.seg >= len(offs):
+                        continue
+                    off, inp, ln = offs[cue.seg]
+                    gs = off + (float(cue.start) - inp)
+                    ge = off + (float(cue.end) - inp)
+                    gs = max(off, gs); ge = min(off + ln, ge)
+                    if ge - gs >= 0.3:
+                        gcues.append((gs / speed, ge / speed, cue.text))
+                if gcues:
+                    ass_name = "subs_" + uuid.uuid4().hex[:12] + ".ass"
+                    ass_path = os.path.join(media_dir, ass_name)
+                    with open(ass_path, "w", encoding="utf-8") as fh:
+                        fh.write(_build_ass(gcues, dims[0], dims[1], spec.size, spec.position, spec.style))
+                    sub_path = out_path + ".sub.mp4"
+                    r2 = subprocess.run([ffmpeg, "-y", "-i", out_path,
+                                         "-vf", "ass=" + ass_name,
+                                         "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+                                         "-pix_fmt", "yuv420p", "-c:a", "copy",
+                                         "-movflags", "+faststart", sub_path],
+                                        capture_output=True, text=True, timeout=1200, cwd=media_dir)
+                    try: os.unlink(ass_path)
+                    except OSError: pass
+                    if r2.returncode == 0 and os.path.isfile(sub_path):
+                        os.replace(sub_path, out_path)
+                        sub_info = {"burned": True, "cues": len(gcues)}
+                    else:
+                        try: os.unlink(sub_path)
+                        except OSError: pass
+                        sub_info = {"burned": False, "error": (r2.stderr or "")[-200:]}
+                else:
+                    sub_info = {"burned": False, "error": "no cues left after trim mapping"}
+            except Exception as exc2:  # noqa: BLE001
+                sub_info = {"burned": False, "error": str(exc2)[:200]}
         vurl = media_url(out_name)
         store.update_task(task_id, status="completed", progress=100, url=vurl,
                           result={"url": vurl, "filename": out_name,
                                   "bytes": os.path.getsize(out_path), "kind": "video",
-                                  "trims": trims})
+                                  "trims": trims, "subtitles": sub_info})
     except Exception as exc:  # noqa: BLE001
         for pth in (padded if 'padded' in locals() else []):
             try: os.unlink(pth)
