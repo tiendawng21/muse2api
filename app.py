@@ -1750,13 +1750,14 @@ def _ass_time(t: float) -> str:
     return f"{h}:{m:02d}:{s:05.2f}"
 
 
-def _ass_escape(text: str) -> str:
+def _ass_escape(text: str, wrapw: int = 24) -> str:
     import textwrap
     t = " ".join(str(text or "").replace("{", "").replace("}", "").split())
     if not t:
         return ""
-    lines = textwrap.wrap(t, width=30)[:2]
-    if len(textwrap.wrap(t, width=30)) > 2:
+    wrapped = textwrap.wrap(t, width=max(14, wrapw))
+    lines = wrapped[:2]
+    if len(wrapped) > 2:
         lines[1] = lines[1].rstrip(" .,") + "…"
     return "\\N".join(lines)
 
@@ -1776,9 +1777,10 @@ def _build_ass(cues, w: int, h: int, size: str, position: str, style: str) -> st
             "Style: TD,DejaVu Sans,%d,%s,&H000000FF,&H00000000,&H64000000,%d,0,0,0,100,100,0,0,1,%.1f,0,%d,24,24,%d,1\n\n"
             "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
             % (w, h, fs, primary, bold, ow, align, mv))
+    wrapw = max(14, int(w * 0.90 / (fs * 0.52)))
     ev = []
     for (gs, ge, text) in cues:
-        t = _ass_escape(text)
+        t = _ass_escape(text, wrapw)
         if t and ge > gs:
             ev.append(f"Dialogue: 0,{_ass_time(gs)},{_ass_time(ge)},TD,,0,0,0,,{t}")
     return head + "\n".join(ev) + "\n"
