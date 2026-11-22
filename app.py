@@ -1665,6 +1665,7 @@ class AssembleRequest(BaseModel):
     speed: float = 1.0
     timeout: int | None = None
     subtitles: SubtitleSpec | None = None
+    upscale: bool = False          # V10.15: upscale bản ghép lên 1080p (lanczos + unsharp) trước khi burn sub
 
 
 def _ffmpeg_exe() -> str | None:
@@ -1866,6 +1867,37 @@ def _run_assemble(task_id: str, req: AssembleRequest):
             tail = (r.stderr or "")[-400:]
             store.update_task(task_id, status="failed", error=f"ffmpeg failed: {tail}")
             return
+        up_info = None
+        if getattr(req, "upscale", False):
+            try:
+                _, uw, uh = _probe_media(ffmpeg, out_path)
+                if uw and uh:
+                    if uh > uw:
+                        tw, th = 1080, 1920
+                    elif uw > uh:
+                        tw, th = 1920, 1080
+                    else:
+                        tw, th = 1080, 1080
+                    if uw < tw:
+                        up_path = out_path + ".up.mp4"
+                        r3 = subprocess.run([ffmpeg, "-y", "-i", out_path,
+                                             "-vf", f"scale={tw}:{th}:flags=lanczos,unsharp=5:5:0.8:5:5:0.0",
+                                             "-c:v", "libx264", "-crf", "16", "-preset", "veryfast",
+                                             "-pix_fmt", "yuv420p", "-c:a", "copy",
+                                             "-movflags", "+faststart", up_path],
+                                            capture_output=True, text=True, timeout=1200)
+                        if r3.returncode == 0 and os.path.isfile(up_path):
+                            os.replace(up_path, out_path)
+                            dims = (tw, th)
+                            up_info = {"upscaled": True, "from": [uw, uh], "to": [tw, th]}
+                        else:
+                            try: os.unlink(up_path)
+                            except OSError: pass
+                            up_info = {"upscaled": False, "error": (r3.stderr or "")[-200:]}
+                    else:
+                        up_info = {"upscaled": False, "error": "already at or above target resolution"}
+            except Exception as exc3:  # noqa: BLE001
+                up_info = {"upscaled": False, "error": str(exc3)[:200]}
         sub_info = None
         spec = getattr(req, "subtitles", None)
         if spec is not None and spec.enabled and spec.cues:
@@ -1914,7 +1946,7 @@ def _run_assemble(task_id: str, req: AssembleRequest):
         store.update_task(task_id, status="completed", progress=100, url=vurl,
                           result={"url": vurl, "filename": out_name,
                                   "bytes": os.path.getsize(out_path), "kind": "video",
-                                  "trims": trims, "subtitles": sub_info})
+                                  "trims": trims, "subtitles": sub_info, "upscale": up_info})
     except Exception as exc:  # noqa: BLE001
         for pth in (padded if 'padded' in locals() else []):
             try: os.unlink(pth)
